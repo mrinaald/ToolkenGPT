@@ -5,6 +5,7 @@ from typing import Optional, Tuple
 from dataclasses import dataclass
 import math
 from typing import List
+import time
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -48,6 +49,21 @@ class RMSNorm(torch.nn.Module):
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    """
+    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+
+    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
+    and the end index 'end'. The 'theta' parameter scales the frequencies.
+    The returned tensor contains complex values in complex64 data type.
+
+    Args:
+        dim (int): Dimension of the frequency tensor.
+        end (int): End index for precomputing frequencies.
+        theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
+
+    Returns:
+        torch.Tensor: Precomputed frequency tensor with complex exponentials.
+    """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device)  # type: ignore
     freqs = torch.outer(t, freqs).float()  # type: ignore
@@ -224,6 +240,16 @@ class Transformer(nn.Module):
 
     # @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
+        """
+        Perform a forward pass through the Transformer model.
+
+        Args:
+            tokens (torch.Tensor): Input token indices.
+            start_pos (int): Starting position for attention caching.
+
+        Returns:
+            torch.Tensor: Output logits after applying the Transformer model.
+        """
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)  # (bsz, partial_seqlen, dim)
         self.freqs_cis = self.freqs_cis.to(h.device)
@@ -239,23 +265,39 @@ class Transformer(nn.Module):
         h = self.norm(h)
         output = self.output(h[:, -1, :])  # only compute last logits
         return output.float(), h
-    
+
 class FunctionLM(nn.Module):
-    def __init__(self, base_model, tokenizer, func_dict, load_path=None, inference_mode="func_embedding"):
+    def __init__(self, base_model, tokenizer, func_dict, device="cpu", load_path=None, inference_mode="func_embedding"):
         super().__init__()
         self.inference_mode = inference_mode
         self.model = base_model
         self.tokenizer = tokenizer
         self.func_dict = func_dict
         self.func_list = {v: k for k, v in func_dict.items()}
+        self.device = device
+        self.precomputed_hidden_state = {}
+        self.precomputed_token_logits = {}
+        # self.toolken_offset = tokenizer.vocab_size            # True for Llama-1, not for Llama-3.2
+        self.toolken_offset = max(max([id for _, id in tokenizer.vocab.items()]) + 1, tokenizer.vocab_size)
+        print(f"Toolken offset: {self.toolken_offset}")
+
         # self.func_embed = ColumnParallelLinear(
         #     base_model.params.dim, len(func_list), bias=False, init_method=lambda x: x
         # )
-        self.func_embed = nn.Linear(base_model.params.dim, len(func_dict), bias=False).to("cuda")
+
+        # # For Llama-1
+        # self.func_embed = nn.Linear(base_model.params.dim, len(func_dict), bias=False).to(device)
+        # For Llama-3.2
+        self.func_embed = nn.Linear(base_model.config.hidden_size, len(func_dict), bias=False).to(device)
+        # self.func_embed = nn.Linear(base_model.config.hidden_size, len(func_dict), bias=False, dtype=self.model.dtype).to(device)
+
+        # self.layer_norm = nn.LayerNorm(base_model.config.hidden_size).to(device)
+
+        print(f"Trying to load... [{load_path}]")
         if load_path is not None and load_path != "None": # load func_embed weights
             embedding = torch.load(load_path)
             if isinstance(embedding, torch.Tensor):
-                embedding = embedding.to("cuda")
+                embedding = embedding.to(device)
                 embedding = {"weight": embedding}
 
             # truncate the embedding if necessary
@@ -264,12 +306,15 @@ class FunctionLM(nn.Module):
                 embedding["weight"] = embedding["weight"][:len(func_dict)]
 
             self.func_embed.load_state_dict(embedding)
-        
+            print(f"Function Embeddings loaded from file [{load_path}]")
+
         # set the basemodel to eval mode and freeze the weights
         self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
         self.logits_bias = 0
+
+        # self.model = torch.compile(self.model)
 
     def set_bias(self, logits_bias):
         self.logits_bias = logits_bias
@@ -283,14 +328,18 @@ class FunctionLM(nn.Module):
         with torch.no_grad():
             # prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=True) for x in raw_inputs]
 
-            raw_input_ids = torch.tensor(self.tokenizer.encode(raw_inputs["text"], bos=True, eos=True))[:]
-            labels = torch.tensor(self.tokenizer.encode(raw_inputs["text"], bos=True, eos=True))[:]
+            # # For Llama-1
+            # raw_input_ids = torch.tensor(self.tokenizer.encode(raw_inputs["text"], bos=True, eos=True))[:]
+            # labels = torch.tensor(self.tokenizer.encode(raw_inputs["text"], bos=True, eos=True))[:]
+            # For Llama-3.2
+            raw_input_ids = torch.tensor([self.tokenizer.bos_token_id] + self.tokenizer.encode(raw_inputs["text"], add_special_tokens=False) + [self.tokenizer.eos_token_id])[:]
+            labels = torch.tensor([self.tokenizer.bos_token_id] + self.tokenizer.encode(raw_inputs["text"], add_special_tokens=False) + [self.tokenizer.eos_token_id])[:]
 
             if "tar_eq" not in raw_inputs:
                 raw_inputs["tar_eq"] = ["<" + raw_inputs["api"] + ">"]
 
             for s, t, eq in zip(raw_inputs["start_token_idx"], raw_inputs["end_token_idx"], raw_inputs["tar_eq"]):
-                
+
                 # for different data formats
                 if "[" in eq:
                     op = re.search(r"(\[.*?\])", eq).group(1)
@@ -300,33 +349,50 @@ class FunctionLM(nn.Module):
 
                 if op not in self.func_dict:
                     op = op[1:-1]
-                labels[s] = self.func_dict[op] + 32000
+                labels[s] = self.func_dict[op] + self.toolken_offset
                 labels[s+1: t] = -100
-            
+
             # labels = labels[1:]
             if only_functoken:
-                labels[labels < 32000] = -100
-            inputs = raw_input_ids[:-1].expand(1, -1).to("cuda")
-            labels = labels[1:].expand(1, -1).to("cuda")
+                labels[labels < self.toolken_offset] = -100
+            inputs = raw_input_ids[:-1].expand(1, -1).to(self.device)
+            labels = labels[1:].expand(1, -1).to(self.device)
 
-            last_logits, h = self.model(inputs, 0) # h: (bsz, seqlen, dim)
-            token_logits = self.model.output(h) # (bsz, seqlen, vocab_size)
-            # print(h.device)
-        
-        func_logits = self.func_embed(h.float()) # (bsz, seqlen, len(func_list))
-        
+            # if raw_inputs["text"] not in self.precomputed_hidden_state:
+
+            # # original
+            # last_logits, h = self.model(inputs, 0) # h: (bsz, seqlen, dim)
+            # token_logits = self.model.output(h) # (bsz, seqlen, vocab_size)
+            # # print(h.device)
+            # With AutoModelForCausalLM
+            outputs = self.model(inputs, output_hidden_states=True)
+            h = outputs.hidden_states[-1]
+            token_logits = outputs.logits
+
+            # self.precomputed_hidden_state[raw_inputs["text"]] = h
+            # self.precomputed_token_logits[raw_inputs["text"]] = token_logits
+
+            # else:
+                # h = self.precomputed_hidden_state[raw_inputs["text"]]
+                # token_logits = self.precomputed_token_logits[raw_inputs["text"]]
+
+        # h = self.layer_norm(h)
+        # func_logits = self.func_embed(h.float()) # (bsz, seqlen, len(func_list))
+        func_logits = self.func_embed(h.to(self.func_embed.weight.dtype)) # (bsz, seqlen, len(func_list))
+
         concat_logits = torch.cat([token_logits, func_logits], dim=-1) # (bsz, seqlen, vocab_size + len(func_list))
-        loss = F.cross_entropy(concat_logits.view(-1, concat_logits.shape[-1]), labels.view(-1), ignore_index=-100)
+        # loss = F.cross_entropy(concat_logits.view(-1, concat_logits.shape[-1]), labels.view(-1), ignore_index=-100)
+        loss = F.cross_entropy(concat_logits.view(-1, concat_logits.shape[-1]).float(), labels.view(-1), ignore_index=-100)
         # check p, r, f1 for each function
         pred = torch.argmax(concat_logits, dim=-1) # (bsz, seqlen)
         pred = pred.view(-1)
         labels = labels.view(-1)
 
-        label_funcs = [labels == self.func_dict[op] + 32000 for op in self.func_dict.keys()]
-        pred_funcs = [pred == self.func_dict[op] + 32000 for op in self.func_dict.keys()]
+        label_funcs = [labels == self.func_dict[op] + self.toolken_offset for op in self.func_dict.keys()]
+        pred_funcs = [pred == self.func_dict[op] + self.toolken_offset for op in self.func_dict.keys()]
         label_funcs = torch.stack(label_funcs, dim=0)
         pred_funcs = torch.stack(pred_funcs, dim=0)
-        
+
         tp = torch.sum(label_funcs * pred_funcs, dim=-1).detach().cpu().numpy()
         pred_funcs = torch.sum(pred_funcs, dim=-1).detach().cpu().numpy()
         true = torch.sum(label_funcs, dim=-1).detach().cpu().numpy()
@@ -338,7 +404,7 @@ class FunctionLM(nn.Module):
 
 
         return loss, results
-    
+
     @torch.no_grad()
     def generate(
         self,
@@ -351,50 +417,114 @@ class FunctionLM(nn.Module):
         disable_func: List[str] = [],
         disable_token: List[int] = [], # 29900, 29896, 29906, 29941, 29946, 29945, 29953, 29955, 29947, 29929: 0, 1, 2, 3, 4, 5, 6, 7, 8, 9
         no_left_parens: bool = False,
-        
+
         objs: List[str] = [],
     ) -> List[str]:
-        
+
+        # print("\n" + "*"*50)
+
         bsz = len(prompts)
         # print("objs", objs)
 
-        obj_encodings = [self.tokenizer.encode("<"+obj+">", bos=False, eos=False)[1:-1] for obj in objs]
+        # # Llama-1
+        # obj_encodings = [self.tokenizer.encode("<"+obj+">", bos=False, eos=False)[1:-1] for obj in objs]
+        # Llama-3.2
+        obj_encodings = [self.tokenizer.encode("<"+obj+">", add_special_tokens=False)[1:-1] for obj in objs]
         # print("obj encoding", obj_encodings)
         assert bsz == 1
-        stop_token_substr = [torch.tensor(x).cuda().long() for x in stop_token if isinstance(x, list)]
+        if self.device == "cuda":
+            stop_token_substr = [torch.tensor(x).cuda().long() for x in stop_token if isinstance(x, list)]
+        else:
+            stop_token_substr = [torch.tensor(x).long() for x in stop_token if isinstance(x, list)]
         stop_token_single = [x for x in stop_token if isinstance(x, int)]
-        
-        func_list = list(self.func_dict.keys())
+        # print(f"stop token: {stop_token} | {stop_token_substr} | {stop_token_single}")
+
+        # func_list = list(self.func_dict.keys())
+        func_list = [self.func_list[v] for v in range(len(self.func_dict))]
 
         # tokenize all the func in func_list
-        func_tokens = [self.tokenizer.encode(x[1:-1], bos=False, eos=False) for x in func_list]
-        
-        generation_log = [] # (token, [(token, logits, prob)])
-        params = self.model.params
-        assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
+        # # Llama-1
+        # func_tokens = [self.tokenizer.encode(x[1:-1], bos=False, eos=False) for x in func_list]
+        # Llama-3.2
+        func_tokens = [self.tokenizer.encode(x[1:-1], add_special_tokens=False) for x in func_list]
 
-        prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+        generation_log = [] # (token, [(token, logits, prob)])
+        # params = self.model.params
+        # assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)     # Batch size not available with Llama-3.2
+
+        # # Llama-1
+        # prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
+        # Llama-3.2
+        prompt_tokens = [[self.tokenizer.bos_token_id] + self.tokenizer.encode(x, add_special_tokens=False) for x in prompts]
 
         min_prompt_size = min([len(t) for t in prompt_tokens])
         max_prompt_size = max([len(t) for t in prompt_tokens])
 
-        total_len = min(params.max_seq_len, max_gen_len + max_prompt_size)
+        # total_len = min(params.max_seq_len, max_gen_len + max_prompt_size)
+        # print(f"min_prompt_size: {min_prompt_size} | max_prompt_size: {max_prompt_size} | max_gen_len: {max_gen_len}")
+        total_len = min(self.model.config.max_position_embeddings, max_gen_len + max_prompt_size)
 
-        tokens = torch.full((bsz, total_len), self.tokenizer.pad_id).cuda().long()
+        # # Llama-1
+        # tokens = torch.full((bsz, total_len), self.tokenizer.pad_id).cuda().long()
+        # for k, t in enumerate(prompt_tokens):
+        #     tokens[k, : len(t)] = torch.tensor(t).long()
+        # input_text_mask = tokens != self.tokenizer.pad_id
+
+        # # Llama-3.2
+        pad_id = self.toolken_offset - 1        # Using last reserved special token as padding. Adding a separate special token in tokenizer updates the vocab size, thus affecting the toolken indices
+
+        if self.device == "cuda":
+            tokens = torch.full((bsz, total_len), pad_id).cuda().long()
+        else:
+            tokens = torch.full((bsz, total_len), pad_id).long()
+
         for k, t in enumerate(prompt_tokens):
             tokens[k, : len(t)] = torch.tensor(t).long()
-        input_text_mask = tokens != self.tokenizer.pad_id
+
+        input_text_mask = tokens != pad_id
         start_pos = min_prompt_size
+        past_key_values = None
         prev_pos = 0
         hs = []
-        
-        for cur_pos in range(start_pos, total_len):
-            _, h = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
-            logits_token = self.model.output(h[:, -1, :]).float() # (bsz, vocab_size)
-            logits_func = self.func_embed(h[:, -1, :].float()) # (bsz, len(func_list))
+
+        # print(f"start_pos: {start_pos} | total_len: {total_len}")
+        loop_s = time.time()
+        for cur_pos_idx, cur_pos in enumerate(range(start_pos, total_len)):
+            iter_s = time.time()
+            """Test this
+            # Forward pass
+            outputs = model(input_ids, output_hidden_states=True)
+
+            # Get the last hidden state
+            last_hidden_state = outputs.hidden_states[-1]
+
+            # Get the logits for the last token
+            logits_token = outputs.logits[:, -1, :].float()
+            """
+            # # Llama-1
+            # _, h = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            # logits_token = self.model.output(h[:, -1, :]).float() # (bsz, vocab_size)
+            # logits_func = self.func_embed(h[:, -1, :].float()) # (bsz, len(func_list))
+
+            # # Llama-3.2
+            model_s = time.time()
+            # outputs = self.model(tokens[:, :cur_pos], output_hidden_states=True)
+
+            # # Llama-3.2 with caching
+            # outputs = self.model(tokens[:, prev_pos:cur_pos], use_cache=True, past_key_values=past_key_values, output_hidden_states=True)
+            outputs = self.model(tokens[:, prev_pos:cur_pos], attention_mask=input_text_mask, use_cache=True, past_key_values=past_key_values, output_hidden_states=True)
+            model_e = time.time()
+            # print(f"Model time: {model_e - model_s:.3f} s")
+
+            h = outputs.hidden_states[-1]
+            past_key_values = outputs.past_key_values
+            logits_token = outputs.logits[:, -1, :].float()
+            logits_func = self.func_embed(h[:, -1, :].to(self.func_embed.weight.dtype))
+
+
             if self.inference_mode != "func_embedding":
                 logits_func = torch.zeros_like(logits_func) - 1e5
-            
+
             if len(disable_token) > 0:
                 logits_token[:, disable_token] = -1e5
 
@@ -404,6 +534,7 @@ class FunctionLM(nn.Module):
             for i, func in enumerate(disable_func):
                 func_id = self.func_dict[func]
                 logits_func[:, func_id] = -1e5
+
             logits_func += self.logits_bias
             logits = torch.cat([logits_token, logits_func], dim=-1)
             if temperature > 0:
@@ -416,6 +547,11 @@ class FunctionLM(nn.Module):
             next_token = torch.where(
                 input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
             )
+
+            # TODO: Update input_text_mask
+            # input_text_mask = torch.cat([input_text_mask, torch.ones((1, 1)).bool().to(self.device)], dim=-1)
+            input_text_mask[:, cur_pos] = True
+
             if return_top > 0:
                 generation_log.append(
                     (next_token[0].item(), [(i.item(), logits[0, i.item()].item()) for i in torch.argsort(logits[0, :], descending=True)[:return_top]])
@@ -423,41 +559,64 @@ class FunctionLM(nn.Module):
             tokens[:, cur_pos] = next_token
             prev_pos = cur_pos
 
-            if next_token[0] >= 32000 or next_token[0] in stop_token_single:
+            iter_e = time.time()
+            # print(f"Iter time: {iter_e - iter_s:.3f} s")
+            if next_token[0] >= self.toolken_offset or next_token[0] in stop_token_single:
                 # print("breaking!!")
                 break
 
             if any([torch.equal(tokens[0, cur_pos - len(substr) + 1: cur_pos + 1], substr) for substr in stop_token_substr]):
                 break
+        loop_e = time.time()
+        # print(f"Loop time {loop_e - loop_s:.3f} s")
 
-
+        # print(f"cur_pos: {cur_pos}", flush=True)
         decoded = []
+        decode_s = time.time()
         for i, t in enumerate(tokens.tolist()):
             # cut to max gen len
             t = t[: len(prompt_tokens[i]) + max_gen_len]
+            # w = len(t)
             # cut to eos tok if any
             try:
-                t = t[: t.index(self.tokenizer.eos_id)]
+                # # Llama-1
+                # t = t[: t.index(self.tokenizer.eos_id)]
+                # # Llama-3.2
+                # x = t.index(self.tokenizer.eos_token_id)
+                # y = [i for i, id in enumerate(t) if id == self.tokenizer.eos_token_id]
+                t = t[: t.index(self.tokenizer.eos_token_id)]
+                # z = len(t)
             except ValueError:
+                # x = 0
+                # y = []
+                # z = 0
                 pass
-            if t[cur_pos] >= 32000:
+
+            # print(start_pos, max_gen_len, max_prompt_size, total_len, "|", cur_pos, i, w, x, y, z, len(t))
+            # The following update is required in case EOS token comes before cur_pos
+            if cur_pos >= len(t):
+                cur_pos = len(t) - 1
+            if t[cur_pos] >= self.toolken_offset:
                 if no_left_parens:
-                    decoded.append(self.tokenizer.decode(t[:cur_pos]) + self.func_list[t[cur_pos] - 32000])
+                    decoded.append(self.tokenizer.decode(t[:cur_pos]) + self.func_list[t[cur_pos] - self.toolken_offset])
                 else:
                     if "<" in self.func_list[0]:
-                        decoded.append(self.tokenizer.decode(t[:cur_pos]) + self.func_list[t[cur_pos] - 32000] + "(")
+                        decoded.append(self.tokenizer.decode(t[:cur_pos]) + self.func_list[t[cur_pos] - self.toolken_offset] + "(")
                     elif "[" in self.func_list[0]:
-                        decoded.append(self.tokenizer.decode(t[:cur_pos]) + self.func_list[t[cur_pos] - 32000] + " <")
+                        decoded.append(self.tokenizer.decode(t[:cur_pos]) + self.func_list[t[cur_pos] - self.toolken_offset] + " <")
                     else:
                         raise NotImplementedError
             else:
                 decoded.append(self.tokenizer.decode(t[:cur_pos + 1]))
-        
+        decode_e = time.time()
+        # print(f"Decode time: {decode_e - decode_s:.3f} s")
+
+        # print("*"*50)
         if return_top > 0:
             return decoded, generation_log
         else:
             return decoded
-    
+
 def sample_top_p(probs, p):
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)

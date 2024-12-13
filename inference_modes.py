@@ -1,3 +1,4 @@
+import time
 import re
 from funchub.math import *
 
@@ -9,12 +10,29 @@ def func_embedding_inference(templates, case_idx, question, funcmodel, temperatu
     logs = []
     funcmodel.inference_mode = "func_embedding"
     func_map = list(funcmodel.func_dict.keys())
+    status = "success"
     try:
         results = []
         func_calls = []
-        while True:
+        whole_iter_s = time.time()
+        while True and status == "success":
+            iter_s = time.time()
             prompt = templates["general"].replace("[QUESTION]", question) + cur_generation
-            results = funcmodel.generate([prompt], max_gen_len=max_gen_len, temperature=temperature, top_p=top_p, stop_token=[13], return_top=return_top)
+            ############################################################
+            # CAUTION:
+            # stop_token=[13] is for Llama-1 tokenizer
+            # For using any other tokenizer, try to use the following:
+            # ```
+            # [l3_tokenizer.encode(l1_tokenizer.decode([t]), add_special_tokens=False)[0] for t in tokens]
+            # ```
+            # The below value is for Llama-3.2 tokenizer
+            ############################################################
+            # results = funcmodel.generate([prompt], max_gen_len=max_gen_len, temperature=temperature, top_p=top_p, stop_token=[13], return_top=return_top)
+            g1_s = time.time()
+            results = funcmodel.generate([prompt], max_gen_len=max_gen_len, temperature=temperature, top_p=top_p, stop_token=[198], return_top=return_top)
+            g1_e = time.time()
+            print(f"G1 time: {g1_e - g1_s:.2f} s", flush=True)
+
             if return_top > 0:
                 results, token_log = results
                 logs.append(token_log)
@@ -37,7 +55,22 @@ def func_embedding_inference(templates, case_idx, question, funcmodel, temperatu
                     prompt = templates[op].replace("[QUESTION]", question) + cur_generation_with_func
                     len_prompt = len(prompt)
                     funcmodel.inference_mode = "baseline"
-                    results = funcmodel.generate([prompt], max_gen_len=max_gen_len, temperature=temperature, top_p=top_p, stop_token=[29897, 3892], return_top=return_top)
+
+                    ############################################################
+                    # CAUTION:
+                    # stop_token=[29897, 3892] is for Llama-1 tokenizer
+                    # For using any other tokenizer, try to use the following:
+                    # ```
+                    # [l3_tokenizer.encode(l1_tokenizer.decode([t]), add_special_tokens=False)[0] for t in tokens]
+                    # ```
+                    # The below value is for Llama-3.2 tokenizer
+                    ############################################################
+                    # results = funcmodel.generate([prompt], max_gen_len=max_gen_len, temperature=temperature, top_p=top_p, stop_token=[29897, 3892], return_top=return_top)
+                    g2_s = time.time()
+                    results = funcmodel.generate([prompt], max_gen_len=max_gen_len, temperature=temperature, top_p=top_p, stop_token=[8, 11992], return_top=return_top)
+                    g2_e = time.time()
+                    print(f"G2 time: {g2_e - g2_s:.2f} s", flush=True)
+
                     funcmodel.inference_mode = "func_embedding"
                     if return_top > 0:
                         results, token_log = results
@@ -53,7 +86,10 @@ def func_embedding_inference(templates, case_idx, question, funcmodel, temperatu
 
                     args = args.replace(" ", "")
                     if "(" not in args or ")" not in args:
-                        raise Exception("invalid args")
+                        # raise Exception("invalid args")
+                        status = f'Exception("invalid args: [{args}]")'
+                        print(status)
+                        break
                     # handle %
                     if '%' in args:
                         temp = args.split("(")[1].split(")")[0].split(",")
@@ -74,29 +110,53 @@ def func_embedding_inference(templates, case_idx, question, funcmodel, temperatu
                         # only generate the next token
                         # disable all the numbers
                         prompt = templates["general"].replace("[QUESTION]", question) + cur_generation
-                        results = funcmodel.generate([prompt], max_gen_len=1, temperature=temperature, top_p=top_p, stop_token=[13], return_top=return_top, disable_token = [29900, 29896, 29906, 29941, 29946, 29945, 29953, 29955, 29947, 29929]) # disable all the numbers: 0-9
+
+                        ############################################################
+                        # CAUTION:
+                        # stop_token=[13] is for Llama-1 tokenizer
+                        # disable_token = [29900, 29896, 29906, 29941, 29946, 29945, 29953, 29955, 29947, 29929] is for Llama-1 tokenizer
+                        #
+                        # For using any other tokenizer, try to use the following:
+                        # ```
+                        # [l3_tokenizer.encode(l1_tokenizer.decode([t]), add_special_tokens=False)[0] for t in tokens]
+                        # ```
+                        # The below values is for Llama-3.2 tokenizer
+                        ############################################################
+                        # results = funcmodel.generate([prompt], max_gen_len=1, temperature=temperature, top_p=top_p, stop_token=[13], return_top=return_top, disable_token = [29900, 29896, 29906, 29941, 29946, 29945, 29953, 29955, 29947, 29929]) # disable all the numbers: 0-9
+                        g3_s = time.time()
+                        results = funcmodel.generate([prompt], max_gen_len=1, temperature=temperature, top_p=top_p, stop_token=[198], return_top=return_top, disable_token = [15, 16, 17, 18, 19, 20, 21, 22, 23, 24]) # disable all the numbers: 0-9
+                        g3_e = time.time()
+                        print(f"G3 time: {g3_e - g3_s:.2f} s", flush=True)
+
                         if return_top > 0:
                             results, token_log = results
                             logs.append(token_log)
                         cur_generation = results[0].replace(templates["general"].replace("[QUESTION]", question), "")
                     except:
-                        # backtrace 
+                        # backtrace
                         current_token += 1
-                        decode_token = lambda x: funcmodel.tokenizer.decode(x) if x < 32000 else func_map[x - 32000]
+                        # decode_token = lambda x: funcmodel.tokenizer.decode(x) if x < 32000 else func_map[x - 32000]
+                        decode_token = lambda x: funcmodel.tokenizer.decode(x) if x < funcmodel.toolken_offset else func_map[x - funcmodel.toolken_offset]
                         cur_generation = cur_generation.split(op)[0] + decode_token(record_tokens[1][current_token][0])
                     break
+            iter_e = time.time()
+            print(f"Iter time: {iter_e - iter_s:.2f} s", flush=True)
             if endflag:
                 break
 
+        whole_iter_e = time.time()
+        print(f"whole iter time: {whole_iter_e - whole_iter_s:.2f} s", flush=True)
         log = {
             "case_idx": case_idx,
             "question": question,
             "func_calls": func_calls,
             "generation": cur_generation.replace("\n", "\\n").strip(),
-            "status": "success"
+            # "status": "success"
+            "status": status,
         }
 
     except Exception as e:
+        raise e
         log = {
             "case_idx": case_idx,
             "question": question,
@@ -122,7 +182,7 @@ def vh_embedding_inference(case_idx, question, funcmodel, temperature, top_p, ma
             print("last func", last_func)
         if "[END]" in inputs.split("Plan:")[-1]:
             break
-    
+
 
     log = {
     "case_idx": case_idx,
@@ -150,9 +210,20 @@ def kamel_embedding_inference(templates, case_idx, question, funcmodel, temperat
                 break
             prompt = templates["funcgeneral"].replace("[QUESTION]", question) + cur_generation
 
-            results = funcmodel.generate([prompt], max_gen_len=max_gen_len, temperature=temperature, top_p=top_p, stop_token=[13])
+            ############################################################
+            # CAUTION:
+            # stop_token=[13] is for Llama-1 tokenizer
+            # For using any other tokenizer, try to use the following:
+            # ```
+            # [l3_tokenizer.encode(l1_tokenizer.decode([t]), add_special_tokens=False)[0] for t in tokens]
+            # ```
+            # The below value is for Llama-3.2 tokenizer
+            ############################################################
+            # results = funcmodel.generate([prompt], max_gen_len=max_gen_len, temperature=temperature, top_p=top_p, stop_token=[13])
+            results = funcmodel.generate([prompt], max_gen_len=max_gen_len, temperature=temperature, top_p=top_p, stop_token=[198])
+
             max_func_call -= 1
-            
+
             cur_generation = results[0].replace(templates["funcgeneral"].replace("[QUESTION]", question), "")
             # one function token is enough
             break
@@ -167,6 +238,7 @@ def kamel_embedding_inference(templates, case_idx, question, funcmodel, temperat
 
     except Exception as e:
         # if local_rank == 0:
+        raise e
         log = {
             "case_idx": case_idx,
             "question": question,

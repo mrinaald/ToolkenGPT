@@ -5,7 +5,7 @@ from typing import Tuple
 import os
 import sys
 import torch
-import fire
+# import fire
 import time
 import json
 import re
@@ -18,6 +18,7 @@ from llama import ModelArgs, Transformer, Tokenizer, FunctionLM
 from inference_modes import func_embedding_inference, kamel_embedding_inference, vh_embedding_inference
 from funchub.math import *
 
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 def setup_model_parallel() -> Tuple[int, int]:
     local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -28,31 +29,41 @@ def setup_model_parallel() -> Tuple[int, int]:
     return local_rank, world_size
 
 
-def load(ckpt_dir: str, tokenizer_path: str, local_rank: int, world_size: int, func_load_path: str, func_dict: dict) -> FunctionLM:
+# def load(ckpt_dir: str, tokenizer_path: str, local_rank: int, world_size: int, func_load_path: str, func_dict: dict) -> FunctionLM:
+def load(model_uri: str, local_rank: int, world_size: int, func_dict: dict, func_load_path: str) -> FunctionLM:
     start_time = time.time()
-    checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
-    assert (
-        world_size == len(checkpoints)
-    ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {world_size}"
-    ckpt_path = checkpoints[local_rank]
-    print("Loading")
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
-    with open(Path(ckpt_dir) / "params.json", "r") as f:
-        params = json.loads(f.read())
+    # checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
+    # assert (
+    #     world_size == len(checkpoints)
+    # ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {world_size}"
+    # ckpt_path = checkpoints[local_rank]
+    # print("Loading")
+    # checkpoint = torch.load(ckpt_path, map_location="cpu")
 
-    model_args: ModelArgs = ModelArgs(max_seq_len=2048, max_batch_size=1, **params)
-    tokenizer = Tokenizer(model_path=tokenizer_path)
-    model_args.vocab_size = tokenizer.n_words
-    torch.set_default_tensor_type(torch.cuda.HalfTensor)
-    model = Transformer(model_args).cuda().half()
-    torch.set_default_tensor_type(torch.FloatTensor)
-    model.load_state_dict(checkpoint, strict=False)
+    # with open(Path(ckpt_dir) / "params.json", "r") as f:
+    #     params = json.loads(f.read())
+
+    # model_args: ModelArgs = ModelArgs(max_seq_len=2048, max_batch_size=1, **params)
+    # tokenizer = Tokenizer(model_path=tokenizer_path)
+    # model_args.vocab_size = tokenizer.n_words
+    # torch.set_default_tensor_type(torch.cuda.HalfTensor)
+    # model = Transformer(model_args).cuda().half()
+    # torch.set_default_tensor_type(torch.FloatTensor)
+    # model.load_state_dict(checkpoint, strict=False)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_uri)
+    model = AutoModelForCausalLM.from_pretrained(model_uri)
+    ## pip install bitsandbytes accelerate
+    # model = AutoModelForCausalLM.from_pretrained(model_uri, device_map="cuda", load_in_8bit=True)
+    # model = AutoModelForCausalLM.from_pretrained(model_uri, device_map="cuda", load_in_4bit=True)
+
     funcmodel = FunctionLM(model, tokenizer, func_dict = func_dict, load_path=func_load_path)
     print(f"Loaded in {time.time() - start_time:.2f} seconds")
     return funcmodel
 
 
-def main(ckpt_dir: str, tokenizer_path: str, temperature: float = 0, top_p: float = 0.95, mode: str = "baseline", dataset = "original", return_top: int = 5, logits_bias: float = 0, func_load_path: str = "None", st_idx=0, ed_idx=10000, suffix=""):
+# def main(ckpt_dir: str, tokenizer_path: str, temperature: float = 0, top_p: float = 0.95, mode: str = "baseline", dataset = "original", return_top: int = 5, logits_bias: float = 0, func_load_path: str = "None", st_idx=0, ed_idx=10000, suffix=""):
+def main(model_uri: str, temperature: float = 0, top_p: float = 0.95, mode: str = "baseline", dataset = "original", return_top: int = 5, logits_bias: float = 0, func_load_path: str = "None", st_idx=0, ed_idx=10000, suffix=""):
     # set random seed
     torch.manual_seed(1)
     torch.cuda.manual_seed_all(1)
@@ -60,16 +71,22 @@ def main(ckpt_dir: str, tokenizer_path: str, temperature: float = 0, top_p: floa
     torch.backends.cudnn.benchmark = False
     random.seed(1)
     np.random.seed(1)
-    size = ckpt_dir.split("/")[-1]
-    local_rank, world_size = setup_model_parallel()
-    if local_rank > 0:
-        sys.stdout = open(os.devnull, 'w')
+    # size = ckpt_dir.split("/")[-1]
+    # local_rank, world_size = setup_model_parallel()
+    # if local_rank > 0:
+    #     sys.stdout = open(os.devnull, 'w')
+    size = model_uri.split("-")[-1]
+    local_rank, world_size = 0, 0
 
     templates = {}
     if dataset == "gsm8k-xl":
         for name in os.listdir("data/gsm8k-xl/template"):
             with open(f"data/gsm8k-xl/template/{name}") as f:
-                templates[name.split("_")[-1].replace(".txt", "")] = f.read()
+                if "__" in name:
+                    # "<" and ">" in filenames got converted to "_" in Windows
+                    templates["<" + name.split("_")[2] + ">"] = f.read()
+                else:
+                    templates[name.split("_")[-1].replace(".txt", "")] = f.read()
         with open(f"data/gsm8k-xl/test.json") as f:
             data = [json.loads(line) for line in f.readlines()]
         raw_test_cases = [i["question"] for i in data]
@@ -86,17 +103,25 @@ def main(ckpt_dir: str, tokenizer_path: str, temperature: float = 0, top_p: floa
     elif dataset == "funcqa_mh":
         for name in os.listdir("data/funcqa/template_mh"):
             with open(f"data/funcqa/template_mh/{name}") as f:
-                templates[name.split("_")[-1].replace(".txt", "")] = f.read()
+                if "__" in name:
+                    # "<" and ">" in filenames got converted to "_" in Windows
+                    templates["<" + name.split("_")[2] + ">"] = f.read()
+                else:
+                    templates[name.split("_")[-1].replace(".txt", "")] = f.read()
         with open("data/funcqa/funcqa_mh.json") as f:
             data = json.load(f)
         test_cases = [i["question"] for i in data]
         max_gen_len = 512
         func_dict = json.load(open("data/funcqa/func_dict.json"))
-    
+
     elif dataset == "funcqa_oh":
         for name in os.listdir("data/funcqa/template_oh"):
             with open(f"data/funcqa/template_oh/{name}") as f:
-                templates[name.split("_")[-1].replace(".txt", "")] = f.read()
+                if "__" in name:
+                    # "<" and ">" in filenames got converted to "_" in Windows
+                    templates["<" + name.split("_")[2] + ">"] = f.read()
+                else:
+                    templates[name.split("_")[-1].replace(".txt", "")] = f.read()
         with open("data/funcqa/funcqa_oh.json") as f:
             data = json.load(f)
         max_gen_len = 512
@@ -145,7 +170,7 @@ def main(ckpt_dir: str, tokenizer_path: str, temperature: float = 0, top_p: floa
         for name in os.listdir("data/kamel/template"):
             with open(f"data/kamel/template/{name}") as f:
                 templates[name.split("_")[-1].replace(".txt", "")] = f.read()
-        
+
         with open(f"data/kamel/test_first_{n_first}.json") as f:
             data = json.load(f)
             test_cases = [i["question"] for i in data]
@@ -158,9 +183,30 @@ def main(ckpt_dir: str, tokenizer_path: str, temperature: float = 0, top_p: floa
         max_func_call = 1
 
 
-    funcmodel = load(ckpt_dir, tokenizer_path, local_rank, world_size, func_load_path=func_load_path, func_dict=func_dict)
+    # funcmodel = load(ckpt_dir, tokenizer_path, local_rank, world_size, func_load_path=func_load_path, func_dict=func_dict)
+    funcmodel = load(model_uri, local_rank, world_size, func_load_path=func_load_path, func_dict=func_dict)
     funcmodel.set_bias(logits_bias)
     funcmodel.eval()
+
+    # test_cases = test_cases[:10]
+
+    print(f"Mode: {mode}")
+    print(f"Dataset: {dataset}")
+    print(f"Logits Bias: {logits_bias}")
+
+    if local_rank == 0:
+        output_dir = f"outputs/{dataset}"
+        os.makedirs(output_dir, exist_ok=True)
+
+        try:
+            func_model_name = func_load_path.split('/')[-1].split('.')[0]
+        except:
+            func_model_name = func_load_path
+
+        output_file = f"{output_dir}/inference-{size}-{func_model_name}-{mode}-{dataset}-bias_{logits_bias}{suffix}.jsonl"
+        if os.path.exists(output_file):
+            f = open(output_file, "w")
+            f.close()
 
     for case_idx, question in tqdm(enumerate(test_cases), total=len(test_cases)):
         if case_idx < st_idx:
@@ -174,18 +220,68 @@ def main(ckpt_dir: str, tokenizer_path: str, temperature: float = 0, top_p: floa
         elif mode == "kamel_embedding_inference":
             log = kamel_embedding_inference(templates, case_idx, question, funcmodel, temperature, top_p, max_gen_len, max_func_call)
 
+
+
         if local_rank == 0:
-            try:
-                func_model_name = func_load_path.split('/')[-1].split('.')[0]
-            except:
-                func_model_name = func_load_path
-
-            output_dir = f"outputs/{dataset}"
-            os.makedirs(output_dir, exist_ok=True)
-
-            with open(f"{output_dir}/inference-{size}-{func_model_name}-{mode}-{dataset}-bias_{logits_bias}{suffix}.jsonl", "a") as f:
+            with open(output_file, "a") as f:
                 f.write(json.dumps(log) + "\n")
 
 
 if __name__ == "__main__":
-    fire.Fire(main)
+    # fire.Fire(main)
+
+    MODEL = "meta-llama/Llama-3.2-1B"
+
+    """
+    inference_llama.py
+    --ckpt_dir $LLAMA_CKPTS/30B
+    --tokenizer_path $LLAMA_CKPTS/tokenizer.model
+    --mode func_embedding
+    --dataset gsm8k-xl
+    --func_load_path checkpoints/gsm8k-xl/epoch_3.pth
+    --logits_bias 3.0
+    """
+
+    """
+    inference_llama.py
+    --ckpt_dir $LLAMA_CKPTS/30B
+    --tokenizer_path $LLAMA_CKPTS/tokenizer.model
+    --mode func_embedding
+    --dataset funcqa_oh
+    --func_load_path checkpoints/funcqa/epoch_7.pth
+    --logits_bias 2.7
+    """
+
+    """
+    inference_llama.py
+    --ckpt_dir $LLAMA_CKPTS/13B
+    --tokenizer_path $LLAMA_CKPTS/tokenizer.model
+    --mode kamel_embedding_inference
+    --dataset kamel_30
+    --func_load_path checkpoints/kamel/epoch_4.pth
+    --logits_bias 10
+    """
+
+    # mode = "func_embedding"
+    # dataset = "gsm8k-xl"
+    # func_load_path = "checkpoints/gsm8k-xl_20241122_1510_lr1e-4_e5/epoch-0_iter-5000.pth"
+    # logits_bias = 3.0
+
+
+    # mode = "func_embedding"
+    # dataset = "funcqa_oh"
+    # func_load_path = "checkpoints/funcqa-siddhant/epoch_1.pth"
+    # logits_bias = 2.7
+
+    mode = "kamel_embedding_inference"
+    dataset = "kamel_234"
+    func_load_path = "checkpoints/kamel_20241122_1225_lr1e-4_e2/epoch-0.pth"
+    logits_bias = 10
+
+    main(
+        model_uri = MODEL,
+        mode = mode,
+        dataset = dataset,
+        func_load_path = func_load_path,
+        logits_bias = logits_bias,
+    )

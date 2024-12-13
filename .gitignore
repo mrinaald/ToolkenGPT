@@ -1,4 +1,5 @@
-data/
+.venv/
+**/__pycache__/
 checkpoints/
 outputs/
 *.zip
