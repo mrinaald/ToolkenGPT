@@ -3,4 +3,5 @@
 
 from .generation import LLaMA
 from .model import ModelArgs, Transformer, FunctionLM
+from .multitask_model import MultiTaskFunctionLM
 from .tokenizer import Tokenizer
