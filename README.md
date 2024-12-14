@@ -1,4 +1,26 @@
-# ToolkenGPT
+# CSE291A Project - ToolkenGPT
+This project is forked from the [original project repo](https://github.com/Ber666/ToolkenGPT)
+
+The goal of the project was to explore the effectiveness of ToolkenGPT framework with more recent and smaller language models like Llama-3.2. In this endeavor, the code required significant modifications in order to use Hugging Face's Transformer library-based model implementations. This allowed for a more flexible framework that can be used to explore different models with ease.
+
+Moreover, the project also aimed at exploring multi-task learning-based strategies and how the ToolkenGPT framework performs when more than one task (like numerical calculation and knowledge-based QA) are trained simultaneously.
+
+Major Files updated from the original source code:
+- `train_llama.py`: This file defines the training pipeline, and was changed to support Hugging Face Transformer library-based implementations
+- `llama/model.py`: This file defines the ToolkenGPT framework model called `FunctionLM` and its training and inference methods. This was also updated to support Hugging Face Transformer library-based implementations
+- `inference_llama.py`: This file defines the inference pipeline, and was changed to support the Hugging Face Transformer library-based implementations
+
+Files newly added
+- `convert_data.py`: Python module used to re-annotate the original dataset with Llama-3.2 tokenizer.
+- `eval_gsm8k_funcqa.py`: Python module inspired from `evaluation/eval_funcqa.ipynb` file to evaluate the inference results of GSM8K-XL and FuncQA datasets.
+- `eval_kamel.py`: Python module inspired from `evaluation/eval_kamel.ipynb` file to evaluate the inference results of KAMEL datasets.
+- `train_llama_multitask.py`: Python module that defines the training pipeline for the Multitask ToolkenGPT framework
+- `llama/multitask_model.py`: Python module that defines the Multitask model called `MultiTaskFunctionLM` and its training and inference methods. This model implementation still has some bugs, so it can only work for the first task from the list of multiple tasks on which the model was trained.
+- `inference_llama_multitask.py`: Python module that helps in generating inference results for the multi-task trained model.
+- `inference_modes_multitask.py`: Python module inspired from `inference_modes.py` that defines helper methods for conducting inference in the multi-task paradigm.
+
+
+# Content from original project
 **Source code for [ToolkenGPT: Augmenting Frozen Language Models with Massive Tools via Tool Embeddings](https://arxiv.org/abs/2305.11554)**
 
 [NeurIPS 2023 (oral)](https://nips.cc/Conferences/2023) | [Best Paper Award at SoCalNLP 2023](https://socalnlp.github.io/symp23/index.html)
