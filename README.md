@@ -1,6 +1,8 @@
 # CSE291A Project - ToolkenGPT
 This project is forked from the [original project repo](https://github.com/Ber666/ToolkenGPT)
 
+Project report: [slides](https://mrinaald.github.io/uploads/cse291a-slides.pdf)
+
 The goal of the project was to explore the effectiveness of ToolkenGPT framework with more recent and smaller language models like Llama-3.2. In this endeavor, the code required significant modifications in order to use Hugging Face's Transformer library-based model implementations. This allowed for a more flexible framework that can be used to explore different models with ease.
 
 Moreover, the project also aimed at exploring multi-task learning-based strategies and how the ToolkenGPT framework performs when more than one task (like numerical calculation and knowledge-based QA) are trained simultaneously.
